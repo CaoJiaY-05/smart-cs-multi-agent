@@ -1,43 +1,40 @@
 """
 Supervisor编排Agent — 中央协调者
 负责接收用户请求，根据意图路由到对应子Agent，汇总结果返回。
-采用LangGraph StateGraph实现，支持并行调度和Human-in-the-Loop断点。
+采用LangGraph StateGraph实现。
 """
 
 from __future__ import annotations
 
+import os
 import operator
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
-from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
+from dotenv import load_dotenv
 
 # 加载环境变量
-from dotenv import load_dotenv
-import os
 load_dotenv()
 
-# 禁用无用的OTEL追踪（修复500报错核心）
+# 禁用追踪（仅保留核心配置，无冗余）
 os.environ["OTEL_SDK_DISABLED"] = "true"
 
+# 导入核心Agent
 from agents.intent_router import IntentRouterAgent
 from agents.knowledge_rag import KnowledgeRAGAgent
 from agents.ticket_handler import TicketHandlerAgent
 from agents.compliance_checker import ComplianceCheckerAgent
+# 导入记忆模块
 from memory.working_memory import WorkingMemory
 from memory.short_term import ShortTermMemory
 from memory.long_term import LongTermMemory
-# 临时禁用追踪装饰器，解决报错
-# from tracing.otel_config import trace_agent_call
 
-# ─── 状态定义 ───
-
+# ─── 全局状态定义 ───
 class AgentState(TypedDict):
-    """Supervisor编排的全局状态"""
-    messages: Annotated[list[BaseMessage], add_messages]
+    messages: Annotated[list[BaseMessage], operator.add]
     user_id: str
     session_id: str
     intent: str
@@ -47,57 +44,42 @@ class AgentState(TypedDict):
     current_agent: str
     retry_count: int
 
-
-# ─── Supervisor节点 ───
-
-SUPERVISOR_SYSTEM_PROMPT = """你是一个智能客服系统的Supervisor（主管编排Agent）。
+# ─── 系统提示词 ───
+SUPERVISOR_SYSTEM_PROMPT = """你是一个智能客服系统的主管（Supervisor）。
 你的职责是：
-1. 分析用户意图，决定分发给哪个子Agent处理
-2. 汇总子Agent的处理结果，生成最终回复
-3. 确保所有回复都经过合规审查
+1. 分析用户意图，分发任务给对应子Agent
+2. 汇总处理结果，生成最终回复
+3. 确保所有回复通过合规审查
 
-可用的子Agent：
-- intent_router: 意图识别和分类
-- knowledge_rag: 知识库检索和回答
-- ticket_handler: 工单创建和查询
-- compliance_checker: 合规审查和敏感词检测
-
-根据用户消息，决定下一步路由到哪个Agent。
+可调用子Agent：
+- knowledge_rag: 知识库问答
+- ticket_handler: 工单处理
+- compliance_checker: 合规审查
 """
 
-
+# ─── 主管核心节点 ───
 class SupervisorNode:
-    """Supervisor决策节点"""
-
     def __init__(self, llm: ChatOpenAI, working_memory: WorkingMemory):
         self.llm = llm
         self.working_memory = working_memory
 
-    # 临时禁用装饰器，解决报错
-    # @trace_agent_call("supervisor")
     async def route_decision(self, state: AgentState) -> AgentState:
-        """分析用户意图，决定路由"""
+        """意图路由决策"""
         messages = state["messages"]
         session_id = state.get("session_id", "default")
-
         context = self.working_memory.get_context(session_id)
 
         routing_prompt = [
             SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
-            SystemMessage(content=f"当前工作记忆上下文: {context}"),
+            SystemMessage(content=f"当前上下文: {context}"),
             *messages,
-            HumanMessage(content=(
-                "请分析用户的最新消息，返回应该路由到的Agent名称。"
-                "只返回以下之一: knowledge_rag, ticket_handler, compliance_checker"
-            )),
+            HumanMessage(content="请分析用户意图，仅返回路由目标：knowledge_rag / ticket_handler")
         ]
 
         response = await self.llm.ainvoke(routing_prompt)
-        # 核心修复：强制转为字符串，避免dict类型报错
         intent = str(response.content).strip().lower()
 
-        valid_intents = {"knowledge_rag", "ticket_handler", "compliance_checker"}
-        if intent not in valid_intents:
+        if intent not in ["knowledge_rag", "ticket_handler"]:
             intent = "knowledge_rag"
 
         self.working_memory.update(session_id, {"last_intent": intent})
@@ -108,23 +90,16 @@ class SupervisorNode:
             "current_agent": "supervisor",
         }
 
-    # @trace_agent_call("supervisor_synthesize")
     async def synthesize_response(self, state: AgentState) -> AgentState:
-        """汇总子Agent结果，生成最终回复"""
-        sub_results = state.get("sub_results", {})
+        """生成最终回答"""
         compliance_passed = state.get("compliance_passed", True)
+        sub_results = state.get("sub_results", {})
 
         if not compliance_passed:
-            final_response = (
-                "抱歉，您的请求涉及敏感内容，已转交人工客服处理。"
-                "工单编号已自动生成，请留意后续通知。"
-            )
+            final_response = "抱歉，您的请求涉及敏感内容，已转交人工客服。"
         else:
-            result_parts = []
-            for agent_name, result in sub_results.items():
-                if result:
-                    result_parts.append(str(result))
-            final_response = "\n\n".join(result_parts) if result_parts else "抱歉，暂时无法处理您的请求，请稍后重试。"
+            result_parts = [str(res) for res in sub_results.values() if res]
+            final_response = "\n\n".join(result_parts) if result_parts else "抱歉，暂时无法处理您的请求。"
 
         return {
             **state,
@@ -132,27 +107,12 @@ class SupervisorNode:
             "messages": [AIMessage(content=final_response)],
         }
 
-
-# ─── 路由函数 ───
-
+# ─── 路由逻辑 ───
 def route_to_agent(state: AgentState) -> str:
-    """根据意图路由到对应Agent节点"""
     intent = state.get("intent", "knowledge_rag")
-    route_map = {
-        "knowledge_rag": "knowledge_rag",
-        "ticket_handler": "ticket_handler",
-        "compliance_check": "compliance_check",
-    }
-    return route_map.get(intent, "knowledge_rag")
+    return intent
 
-
-def should_check_compliance(state: AgentState) -> str:
-    """所有回复都需经过合规审查"""
-    return "compliance_check"
-
-
-# ─── 构建Graph ───
-
+# ─── 构建流程图 ───
 def create_supervisor_graph(
     llm: ChatOpenAI | None = None,
     working_memory: WorkingMemory | None = None,
@@ -160,23 +120,11 @@ def create_supervisor_graph(
     long_term_memory: LongTermMemory | None = None,
     enable_checkpointing: bool = True,
 ) -> StateGraph:
-    """
-    构建Supervisor编排的多Agent StateGraph。
 
-    这是整个系统的核心入口，将4个子Agent通过有向图连接起来，
-    由Supervisor节点负责路由决策和结果汇总。
-
-    Args:
-        llm: 语言模型实例
-        working_memory: 工作记忆
-        short_term_memory: 短期记忆
-        long_term_memory: 长期记忆
-        enable_checkpointing: 是否启用检查点（支持断点恢复）
-    """
+    load_dotenv()
     if llm is None:
-        # 配置已修复：读取.env + 强制DeepSeek模型
         llm = ChatOpenAI(
-            model=os.getenv("MODEL_NAME", "deepseek-v4-pro"),
+            model=os.getenv("MODEL_NAME"),  # 完全读取配置，不强制任何模型
             openai_api_key=os.getenv("OPENAI_API_KEY"),
             openai_api_base=os.getenv("OPENAI_BASE_URL"),
             temperature=0.7
@@ -184,39 +132,30 @@ def create_supervisor_graph(
     if working_memory is None:
         working_memory = WorkingMemory()
 
+    # 初始化Agent
     supervisor = SupervisorNode(llm, working_memory)
-
-    intent_router = IntentRouterAgent(llm)
     knowledge_agent = KnowledgeRAGAgent(llm, long_term_memory)
     ticket_agent = TicketHandlerAgent(llm)
     compliance_agent = ComplianceCheckerAgent(llm)
 
+    # 构建流程图
     graph = StateGraph(AgentState)
-
+    
+    # 添加节点
     graph.add_node("supervisor_route", supervisor.route_decision)
     graph.add_node("knowledge_rag", knowledge_agent.process)
     graph.add_node("ticket_handler", ticket_agent.process)
     graph.add_node("compliance_check", compliance_agent.process)
     graph.add_node("synthesize", supervisor.synthesize_response)
 
+    # 流程编排
     graph.set_entry_point("supervisor_route")
-
-    graph.add_conditional_edges(
-        "supervisor_route",
-        route_to_agent,
-        {
-            "knowledge_rag": "knowledge_rag",
-            "ticket_handler": "ticket_handler",
-            "compliance_check": "compliance_check",
-        },
-    )
-
+    graph.add_conditional_edges("supervisor_route", route_to_agent)
     graph.add_edge("knowledge_rag", "compliance_check")
     graph.add_edge("ticket_handler", "compliance_check")
     graph.add_edge("compliance_check", "synthesize")
     graph.add_edge("synthesize", END)
 
+    # 内存持久化
     checkpointer = MemorySaver() if enable_checkpointing else None
-    compiled = graph.compile(checkpointer=checkpointer)
-
-    return compiled
+    return graph.compile(checkpointer=checkpointer)
