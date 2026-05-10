@@ -5,37 +5,49 @@ FastAPI入口 — 提供REST API + SSE流式响应
 from __future__ import annotations
 
 import os
-import uuid
-from contextlib import asynccontextmanager
+import uuid#生成唯一会话id（每个聊天窗口一个ID）
+from contextlib import asynccontextmanager#管理项目生命周期
 from typing import AsyncGenerator
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv#读取.env配置文件（API Key/端口等）
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware#跨域（允许前端访问接口）
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-
-from agents.supervisor import create_supervisor_graph
-from memory.working_memory import WorkingMemory
-from memory.short_term import ShortTermMemory
-from memory.long_term import LongTermMemory
-from mcp.mcp_server import MCPToolServer, create_default_tools
-from tracing.otel_config import init_tracer, AgentMetrics
-
+from pydantic import BaseModel #定义消息格式
+#核心组件（机器人的大脑/记忆/工具）
+from agents.supervisor import create_supervisor_graph#（总调度）
+from memory.working_memory import WorkingMemory#工作记忆（当前任务）
+from memory.short_term import ShortTermMemory#短期记忆（对话历史）
+from memory.long_term import LongTermMemory#长期记忆（知识库/问档）
+from mcp.mcp_server import MCPToolServer, create_default_tools#工具服务（查订单/查业务）
+from tracing.otel_config import init_tracer, AgentMetrics#监控/统计
+#前端
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+#读取.env配置文件
 load_dotenv()
 
-
+#————————————————机器人的三种记忆——————————————————————————
 working_memory = WorkingMemory()
+#redis_url:存储聊天记录的地址，默认本地的Redis
 short_term_memory = ShortTermMemory(redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+#index_path：知识库存在电脑的路径，默认存在 vector_store 文件夹里
 long_term_memory = LongTermMemory(index_path=os.getenv("FAISS_INDEX_PATH", "./vector_store/faiss_index"))
+# ---------------------- 2. 初始化机器人的「工具箱」----------------------
 mcp_server = create_default_tools(MCPToolServer())
+# ---------------------- 3. 初始化系统「监控仪表盘」----------------------
+# 记录机器人的工作数据：回答了多少次、调用了什么工具、耗时多久
 metrics = AgentMetrics()
+# ---------------------- 4. 预留「AI大脑」容器 ----------------------
+# 作用：后面项目启动时，把**总调度大脑（多Agent流程图）** 装进来
 graph = None
 
-
+# 装饰器：标记这是一个「异步生命周期管理函数」
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
+     # 因为上面我们定义了 graph = None，这里要给它赋值「AI大脑」
     global graph
 
     init_tracer(
@@ -70,7 +82,21 @@ app = FastAPI(
     description="基于LangGraph的Supervisor编排多Agent智能客服系统",
     version="1.0.0",
     lifespan=lifespan,
+   
 )
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/", include_in_schema=False)
+async def root():
+    return FileResponse("static/index.html")
 
 app.add_middleware(
     CORSMiddleware,

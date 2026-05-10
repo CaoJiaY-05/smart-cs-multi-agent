@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>政务服务智能问答</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="header">
+        <div class="header-content">
+            <h1>政务服务智能问答</h1>
+        </div>
+    </div>
+    <div class="main-container">
+        <div class="chat-window" id="chatWindow">
+            <!-- 聊天消息将在这里显示 -->
+        </div>
+        <div class="sidebar">
+            <div class="sidebar-item">
+                <h3>热门问题</h3>
+                <ul>
+                    <li><a href="#" onclick="fillInput('如何办理身份证？')">如何办理身份证？</a></li>
+                    <li><a href="#" onclick="fillInput('社保怎么查询？')">社保怎么查询？</a></li>
+                    <li><a href="#" onclick="fillInput('公积金怎么提取？')">公积金怎么提取？</a></li>
+                </ul>
+            </div>
+            <div class="sidebar-item">
+                <h3>快捷服务</h3>
+                <ul>
+                    <li><a href="#" onclick="fillInput('个人业务办理流程')">个人业务办理流程</a></li>
+                    <li><a href="#" onclick="fillInput('企业注册指南')">企业注册指南</a></li>
+                </ul>
+            </div>
+            <div class="sidebar-item">
+                <h3>历史记录</h3>
+                <ul id="historyList">
+                    <!-- 历史记录将在这里显示 -->
+                </ul>
+            </div>
+        </div>
+    </div>
+    <div class="footer">
+        <input type="text" id="userInput" placeholder="请输入您的问题...">
+        <button id="sendButton">发送</button>
+    </div>
+    <script src="/static/js/main.js"></script>
+</body>
+</html>
